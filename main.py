@@ -1,11 +1,13 @@
+import math
 import sys
 import os
 import cv2
 import numpy as np
+import colorsys
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QScrollArea, QFileDialog, QFrame,
-                             QSplitter, QComboBox, QToolBar, QLayout, QSlider)
-from PyQt6.QtCore import Qt, QMimeData, QSize, pyqtSignal, QPoint, QUrl, QRect, QEvent
+                             QSplitter, QComboBox, QToolBar, QLayout, QSlider, QCheckBox)
+from PyQt6.QtCore import Qt, QMimeData, QSize, pyqtSignal, QPoint, QUrl, QRect, QEvent, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QDrag, QColor, QPalette, QShortcut, QKeySequence
 
 class DropZone(QLabel):
@@ -21,13 +23,14 @@ class DropZone(QLabel):
                 border: 2px dashed #555;
                 border-radius: 10px;
                 background-color: #2b2b2b;
-                color: #aaa;
+                color: #eee;
                 font-size: 16px;
                 min-height: 80px;
             }
             QLabel:hover {
                 border-color: #0078d7;
                 background-color: #333;
+                color: #fff;
             }
         """)
 
@@ -165,9 +168,15 @@ class ThumbnailItem(QFrame):
         ctrl_layout = QHBoxLayout()
         self.minus_btn = QPushButton("-")
         self.minus_btn.setFixedSize(20, 20)
+        self.minus_btn.setAutoRepeat(True)
+        self.minus_btn.setAutoRepeatDelay(300)
+        self.minus_btn.setAutoRepeatInterval(50)
         self.minus_btn.clicked.connect(self.decrease_edge)
         self.plus_btn = QPushButton("+")
         self.plus_btn.setFixedSize(20, 20)
+        self.plus_btn.setAutoRepeat(True)
+        self.plus_btn.setAutoRepeatDelay(300)
+        self.plus_btn.setAutoRepeatInterval(50)
         self.plus_btn.clicked.connect(self.increase_edge)
         
         ctrl_layout.addWidget(self.minus_btn)
@@ -183,8 +192,8 @@ class ThumbnailItem(QFrame):
         self.update_size()
         self.setStyleSheet("""
             QFrame { border: 2px solid transparent; background: #3c3f41; border-radius: 5px; }
-            QLabel { background: transparent; }
-            QPushButton { background: #555; border-radius: 3px; font-weight: bold; }
+            QLabel { background: transparent; color: #eee; }
+            QPushButton { background: #555; border-radius: 3px; font-weight: bold; color: white; }
             QComboBox { background: #555; color: white; border-radius: 3px; font-size: 10px; }
         """)
 
@@ -257,6 +266,7 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorGroup.All, QPalette.ColorRole.Highlight, QColor(42, 130, 218))
         palette.setColor(QPalette.ColorGroup.All, QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
         self.setPalette(palette)
+        self.setStyleSheet("QLabel { color: #eee; }")
 
         self.base_image_path = None
         self.edited_images_paths = []
@@ -267,9 +277,16 @@ class MainWindow(QMainWindow):
         self.min_region_size = 0
         self.max_region_size = 1000000
         self.preview_zoom = 1.0
+        self.pulse_fade = 0
+        self.pulse_angle = 0
+        self.base_img = None
 
         self.setup_ui()
         self.setup_shortcuts()
+        
+        self.pulse_timer = QTimer()
+        self.pulse_timer.timeout.connect(self.update_pulse)
+        self.pulse_timer.start(50)
 
     def setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl++"), self, self.zoom_in)
@@ -315,9 +332,48 @@ class MainWindow(QMainWindow):
         return super().eventFilter(source, event)
 
     def on_preview_zoom_slider_changed(self, value):
+        if not hasattr(self, '_setting_zoom_from_fit') or not self._setting_zoom_from_fit:
+            if self.fit_checkbox.isChecked():
+                self.fit_checkbox.blockSignals(True)
+                self.fit_checkbox.setChecked(False)
+                self.fit_checkbox.blockSignals(False)
         self.preview_zoom = value / 100.0
         self.zoom_status_label.setText(f"{value}%")
         self.update_preview()
+
+    def on_fit_checkbox_changed(self, state):
+        if state == Qt.CheckState.Checked.value:
+            self.apply_fit_to_window()
+
+    def apply_fit_to_window(self):
+        if not self.current_preview_pixmap:
+            return
+        
+        available_width = self.preview_scroll.viewport().width() - 4 # Small margin
+        available_height = self.preview_scroll.viewport().height() - 4
+        
+        img_width = self.current_preview_pixmap.width()
+        img_height = self.current_preview_pixmap.height()
+        
+        if img_width <= 0 or img_height <= 0:
+            return
+            
+        zoom_w = available_width / img_width
+        zoom_h = available_height / img_height
+        zoom = min(zoom_w, zoom_h)
+        
+        # Clamp to slider range (10% to 500%)
+        zoom = max(0.1, min(5.0, zoom))
+        
+        self._setting_zoom_from_fit = True
+        self.zoom_slider.setValue(int(zoom * 100))
+        self._setting_zoom_from_fit = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'fit_checkbox') and self.fit_checkbox.isChecked():
+            # Delay slightly or call directly to ensure viewport size is updated
+            QTimer.singleShot(0, self.apply_fit_to_window)
 
     def zoom_in(self):
         self.thumb_size = min(300, self.thumb_size + 20)
@@ -372,12 +428,6 @@ class MainWindow(QMainWindow):
         top_row_layout.addLayout(edited_layout, 1)
         main_layout.addLayout(top_row_layout)
 
-        # Action Button
-        self.analyze_btn = QPushButton("Analyze Differences")
-        self.analyze_btn.setFixedHeight(40)
-        self.analyze_btn.clicked.connect(self.analyze_differences)
-        main_layout.addWidget(self.analyze_btn)
-
         # Results area with Splitter
         self.results_splitter = QSplitter(Qt.Orientation.Horizontal)
         
@@ -387,6 +437,7 @@ class MainWindow(QMainWindow):
         thumb_vbox.setContentsMargins(0, 0, 0, 0)
         
         self.toolbar = QToolBar()
+        self.toolbar.setStyleSheet("color: white")
         self.toolbar.addAction("Zoom +", self.zoom_in)
         self.toolbar.addAction("Zoom -", self.zoom_out)
         self.toolbar.addSeparator()
@@ -409,7 +460,39 @@ class MainWindow(QMainWindow):
         
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea { border: none; background-color: #2b2b2b; }
+            QScrollBar:vertical {
+                background: #2b2b2b;
+                width: 12px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #444;
+                min-height: 20px;
+                border-radius: 5px;
+                margin: 2px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #2b2b2b;
+                height: 12px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #444;
+                min-width: 20px;
+                border-radius: 5px;
+                margin: 2px;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """)
         self.thumbnails_widget = QWidget()
+        self.thumbnails_widget.setStyleSheet("background-color: #2b2b2b;")
         self.thumbnails_layout = FlowLayout(self.thumbnails_widget, spacing=10)
         self.scroll_area.setWidget(self.thumbnails_widget)
         # Install event filter to thumbnails area to handle CTRL+Wheel zoom without scrolling
@@ -450,11 +533,32 @@ class MainWindow(QMainWindow):
         
         self.zoom_status_label = QLabel("100%")
         btn_layout.addWidget(self.zoom_status_label)
+        
+        self.fit_checkbox = QCheckBox("Fit to Window")
+        self.fit_checkbox.setStyleSheet("color: white;")
+        self.fit_checkbox.stateChanged.connect(self.on_fit_checkbox_changed)
+        self.fit_checkbox.setChecked(True)
+        btn_layout.addWidget(self.fit_checkbox)
+        
         btn_layout.addStretch()
         
         self.save_btn = QPushButton("Save PNG")
         self.save_btn.clicked.connect(self.save_preview)
         self.save_btn.setFixedHeight(30)
+        self.save_btn.setFixedWidth(100)
+        self.save_btn.setStyleSheet("""
+            QPushButton { 
+                background-color: #3c3f41; 
+                color: white; 
+                border: 1px solid #555; 
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #4c5052;
+                border-color: #0078d7;
+            }
+        """)
         btn_layout.addWidget(self.save_btn)
         
         preview_vbox.addLayout(btn_layout)
@@ -466,18 +570,22 @@ class MainWindow(QMainWindow):
 
     def set_base_image(self, path):
         self.base_image_path = path
+        self.base_img = cv2.imread(path)
         self.base_drop_zone.setText(f"Base Image: {os.path.basename(path)}")
+        self.analyze_differences()
         self.update_preview()
 
     def append_edited_image(self, path):
         if path not in self.edited_images_paths:
             self.edited_images_paths.append(path)
             self.update_edited_list()
+            self.analyze_differences()
 
     def reset_edited_images(self):
         self.edited_images_paths = []
         self.update_edited_list()
         self.clear_thumbnails()
+        self.analyze_differences()
         self.update_preview()
 
     def update_edited_list(self):
@@ -534,11 +642,15 @@ class MainWindow(QMainWindow):
 
     def analyze_differences(self):
         if not self.base_image_path or not self.edited_images_paths:
+            self.clear_thumbnails()
             return
 
         self.clear_thumbnails()
-        base_img = cv2.imread(self.base_image_path)
-        if base_img is None: return
+        if self.base_img is None:
+            self.base_img = cv2.imread(self.base_image_path)
+        
+        if self.base_img is None: return
+        base_img = self.base_img
 
         # First pass: find all differences and merge them into a heatmap
         all_diff_data = [] # List of (edit_img, thresh_mask)
@@ -554,10 +666,10 @@ class MainWindow(QMainWindow):
             diff = cv2.absdiff(base_img, edit_img)
             gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             
-            # Use 50 as a reasonable threshold for JPEG artifacts. 
-            ret, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
+            # Use 25 as a more sensitive threshold. 
+            ret, thresh = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
             
-            kernel = np.ones((5,5), np.uint8)
+            kernel = np.ones((3,3), np.uint8)
             thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
             thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
             
@@ -686,7 +798,8 @@ class MainWindow(QMainWindow):
         mask = np.zeros(region['mask'].shape, dtype=np.uint8)
         
         if thumb_item.shape_type == "Overlap":
-            mask = region['region_mask'].copy()
+            hull = cv2.convexHull(cnt)
+            cv2.drawContours(mask, [hull], -1, 255, -1)
         elif thumb_item.shape_type == "Tight Fit":
             # For Tight Fit, we use the image-specific mask within this region
             mask = cv2.bitwise_and(region['image_mask'], region['region_mask'])
@@ -711,15 +824,23 @@ class MainWindow(QMainWindow):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             region['master_approx'] = max(contours, key=cv2.contourArea) # Update approx for overlay
-        
+
+    def update_pulse(self):
+        self.pulse_fade = self.pulse_fade + 1
+        self.pulse_angle = (self.pulse_angle + 10) % 360
+        if self.hovered_region_id is not None:
+            self.update_preview()
+
     def update_preview(self):
         if not self.base_image_path:
             self.preview_label.setText("No Base Image")
             return
 
-        base_img = cv2.imread(self.base_image_path)
-        if base_img is None: return
-        base_img = cv2.cvtColor(base_img, cv2.COLOR_BGR2RGB)
+        if self.base_img is None:
+            self.base_img = cv2.imread(self.base_image_path)
+            
+        if self.base_img is None: return
+        base_img = cv2.cvtColor(self.base_img, cv2.COLOR_BGR2RGB)
         
         composite = base_img.copy().astype(np.float32)
         
@@ -739,8 +860,15 @@ class MainWindow(QMainWindow):
         if self.hovered_region_id is not None:
             region = self.found_regions[self.hovered_region_id]
             overlay = composite.copy()
-            cv2.drawContours(overlay, [region['master_approx']], -1, (255, 255, 0), 2)
-            composite = cv2.addWeighted(overlay, 0.7, composite, 0.3, 0)
+            
+            # Rainbow pulse
+            hue = (self.pulse_angle % 360) / 360.0
+            r_val, g_val, b_val = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            color = (int(r_val * 255), int(g_val * 255), int(b_val * 255))
+            
+            cv2.drawContours(overlay, [region['master_approx']], -1, color, 3)
+            alpha = math.sin(self.pulse_fade / 10.0) * 0.5 + 0.5
+            composite = cv2.addWeighted(overlay, alpha, composite, 1.0 - alpha, 0)
 
         h, w, c = composite.shape
         q_img = QImage(composite.data, w, h, 3 * w, QImage.Format.Format_RGB888)
@@ -752,6 +880,8 @@ class MainWindow(QMainWindow):
         scaled_pix = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.preview_label.setPixmap(scaled_pix)
         self.preview_label.setFixedSize(scaled_pix.size())
+
+        self.apply_fit_to_window()
 
     def copy_preview_to_clipboard(self, event):
         if self.current_preview_pixmap:
