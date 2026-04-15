@@ -285,8 +285,10 @@ class MainWindow(QMainWindow):
         self.current_preview_pixmap = None
         self.thumb_size = 110
         self.hovered_region_id = None
-        self.min_region_size = 0
-        self.max_region_size = 1000000
+        self.num_buckets = 10
+        self.min_bucket = 1
+        self.max_bucket = 10
+        self.bucket_boundaries = []
         self.preview_zoom = 1.0
         self.pulse_fade = 0
         self.pulse_angle = 0
@@ -561,18 +563,19 @@ class MainWindow(QMainWindow):
         self.toolbar.addAction("Zoom +", self.zoom_in)
         self.toolbar.addAction("Zoom -", self.zoom_out)
         self.toolbar.addSeparator()
-        self.toolbar.addWidget(QLabel(" Min: "))
+        self.toolbar.addWidget(QLabel(" Min Batch: "))
         self.min_size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.min_size_slider.setRange(0, 10000)
+        self.min_size_slider.setRange(1, 10)
         self.min_size_slider.setFixedWidth(100)
+        self.min_size_slider.setValue(1)
         self.min_size_slider.valueChanged.connect(self.on_min_size_changed)
         self.toolbar.addWidget(self.min_size_slider)
         
-        self.toolbar.addWidget(QLabel(" Max: "))
+        self.toolbar.addWidget(QLabel(" Max Batch: "))
         self.max_size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.max_size_slider.setRange(0, 10000)
+        self.max_size_slider.setRange(1, 10)
         self.max_size_slider.setFixedWidth(100)
-        self.max_size_slider.setValue(10000)
+        self.max_size_slider.setValue(10)
         self.max_size_slider.valueChanged.connect(self.on_max_size_changed)
         self.toolbar.addWidget(self.max_size_slider)
         
@@ -855,39 +858,57 @@ class MainWindow(QMainWindow):
                     self.update_region_mask(region_id)
         
         if self.found_regions:
-            max_area = max(r['area'] for r in self.found_regions)
-            self.min_size_slider.setMaximum(int(max_area))
-            self.max_size_slider.setMaximum(int(max_area))
-            self.max_size_slider.setValue(int(max_area))
+            self.min_size_slider.setValue(1)
+            self.max_size_slider.setValue(10)
         else:
-            self.min_size_slider.setMaximum(10000)
-            self.max_size_slider.setMaximum(10000)
-            self.max_size_slider.setValue(10000)
+            self.min_size_slider.setValue(1)
+            self.max_size_slider.setValue(10)
         self.update_thumbnail_visibility()
 
     def on_min_size_changed(self, value):
-        self.min_region_size = value
-        if value >= self.max_size_slider.value():
-            self.max_size_slider.setValue(value + 1)
+        self.min_bucket = value
+        if value > self.max_size_slider.value():
+            self.max_size_slider.setValue(value)
         self.needs_recomposite = True
         self.update_thumbnail_visibility()
         self.update_preview()
 
     def on_max_size_changed(self, value):
-        self.max_region_size = value
-        if value <= self.min_size_slider.value():
-            self.min_size_slider.setValue(max(0, value - 1))
+        self.max_bucket = value
+        if value < self.min_size_slider.value():
+            self.min_size_slider.setValue(value)
         self.needs_recomposite = True
         self.update_thumbnail_visibility()
         self.update_preview()
 
+    def update_buckets(self):
+        if not self.found_regions:
+            self.bucket_boundaries = []
+            return
+        areas = [r['area'] for r in self.found_regions]
+        # Calculate boundaries for self.num_buckets using quantiles
+        self.bucket_boundaries = np.percentile(areas, np.linspace(0, 100, self.num_buckets + 1)).tolist()
+
+    def get_bucket_for_area(self, area):
+        if not self.bucket_boundaries:
+            return 1
+        # The first bucket includes the minimum value
+        if area <= self.bucket_boundaries[1]:
+            return 1
+        for i in range(2, len(self.bucket_boundaries)):
+            if area <= self.bucket_boundaries[i]:
+                return i
+        return self.num_buckets
+
     def update_thumbnail_visibility(self):
+        self.update_buckets()
         for i in range(self.thumbnails_layout.count()):
             widget = self.thumbnails_layout.itemAt(i).widget()
             if isinstance(widget, ThumbnailItem):
                 region_id = widget.region_id
                 area = self.found_regions[region_id]['area']
-                if area < self.min_region_size or area > self.max_region_size:
+                bucket = self.get_bucket_for_area(area)
+                if bucket < self.min_bucket or bucket > self.max_bucket:
                     widget.hide()
                 else:
                     widget.show()
@@ -907,6 +928,7 @@ class MainWindow(QMainWindow):
 
     def on_thumbnail_settings_changed(self, region_id):
         self.update_region_mask(region_id)
+        self.update_thumbnail_visibility()
         self.needs_recomposite = True
         self.update_preview()
 
@@ -949,6 +971,7 @@ class MainWindow(QMainWindow):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             region['master_approx'] = max(contours, key=cv2.contourArea) # Update approx for overlay
+            region['area'] = cv2.countNonZero(mask)
 
     def update_pulse(self):
         self.pulse_fade = self.pulse_fade + 1
