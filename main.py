@@ -10,6 +10,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtCore import Qt, QMimeData, QSize, pyqtSignal, QPoint, QUrl, QRect, QEvent, QTimer, QPointF
 from PyQt6.QtGui import QPixmap, QImage, QDrag, QColor, QPalette, QShortcut, QKeySequence
 
+def truncate(string, max_length=30):
+    if len(string) > max_length:
+        return string[:max_length] + "..."
+    return string
+
 class DropZone(QLabel):
     fileDropped = pyqtSignal(str)
 
@@ -153,7 +158,7 @@ class ThumbnailItem(QFrame):
         self.selected = False
         self.thumb_size = thumb_size
         self.edge_margin = 0
-        self.shape_type = "Overlap"
+        self.shape_type = "Convex Hull"
         
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(4, 4, 4, 4)
@@ -178,17 +183,17 @@ class ThumbnailItem(QFrame):
         self.plus_btn.setAutoRepeatDelay(300)
         self.plus_btn.setAutoRepeatInterval(50)
         self.plus_btn.clicked.connect(self.increase_edge)
-        
+
+        self.shape_combo = QComboBox()
+        self.shape_combo.setStyleSheet("color: white")
+        self.shape_combo.addItems(["Convex Hull", "Rectangle", "Circle"])
+        self.shape_combo.currentTextChanged.connect(self.on_shape_changed)
+
         ctrl_layout.addWidget(self.minus_btn)
-        ctrl_layout.addWidget(QLabel("Edge"))
+        ctrl_layout.addWidget(self.shape_combo)
         ctrl_layout.addWidget(self.plus_btn)
         self.layout.addLayout(ctrl_layout)
-        
-        self.shape_combo = QComboBox()
-        self.shape_combo.addItems(["Overlap", "Tight Fit", "Rectangle", "Circle"])
-        self.shape_combo.currentTextChanged.connect(self.on_shape_changed)
-        self.layout.addWidget(self.shape_combo)
-        
+
         self.update_size()
         self.setStyleSheet("""
             QFrame { border: 2px solid transparent; background: #3c3f41; border-radius: 5px; }
@@ -280,6 +285,12 @@ class MainWindow(QMainWindow):
         self.pulse_fade = 0
         self.pulse_angle = 0
         self.base_img = None
+        self.composite_cache = None
+        self.needs_recomposite = True
+
+        self.fit_timer = QTimer()
+        self.fit_timer.setSingleShot(True)
+        self.fit_timer.timeout.connect(self.apply_fit_to_window)
 
         self.setup_ui()
         self.setup_shortcuts()
@@ -397,8 +408,10 @@ class MainWindow(QMainWindow):
         if self.base_img is None:
             return
         
-        available_width = self.preview_scroll.viewport().width() - 4 # Small margin
-        available_height = self.preview_scroll.viewport().height() - 4
+        # Use maximumViewportSize to avoid scrollbar feedback loop
+        viewport_size = self.preview_scroll.maximumViewportSize()
+        available_width = viewport_size.width() - 4 # Small margin
+        available_height = viewport_size.height() - 4
         
         img_height, img_width = self.base_img.shape[:2]
         
@@ -419,8 +432,11 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, 'fit_checkbox') and self.fit_checkbox.isChecked():
-            # Delay slightly or call directly to ensure viewport size is updated
-            QTimer.singleShot(0, self.apply_fit_to_window)
+            self.fit_timer.start(50)
+
+    def on_splitter_moved(self, pos, index):
+        if hasattr(self, 'fit_checkbox') and self.fit_checkbox.isChecked():
+            self.fit_timer.start(50)
 
     def zoom_in(self):
         self.thumb_size = min(300, self.thumb_size + 20)
@@ -443,40 +459,37 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Top Row: Base and Edited Sections
-        top_row_layout = QHBoxLayout()
-
-        # Base Image Section
-        self.base_drop_zone = DropZone("Base Image\nDrop here or Click")
+        # Top Row: Both Drop Zones (50/50 width)
+        drop_zones_layout = QHBoxLayout()
+        
+        self.base_drop_zone = DropZone("Base Image:\nClick or Drop Here")
         self.base_drop_zone.fileDropped.connect(self.set_base_image)
         self.base_drop_zone.setFixedHeight(80)
-        top_row_layout.addWidget(self.base_drop_zone, 1)
+        drop_zones_layout.addWidget(self.base_drop_zone, 1)
 
-        # Edited Images Section
-        edited_layout = QVBoxLayout()
-        self.edited_drop_zone = DropZone("Edited Images\nDrop here or Click", multiple=True)
+        self.edited_drop_zone = DropZone("Edited Images:\nClick or Drop Here", multiple=True)
         self.edited_drop_zone.fileDropped.connect(self.append_edited_image)
-        self.edited_drop_zone.setFixedHeight(40)
-        edited_layout.addWidget(self.edited_drop_zone)
+        self.edited_drop_zone.setFixedHeight(80)
+        drop_zones_layout.addWidget(self.edited_drop_zone, 1)
         
-        reset_hbox = QHBoxLayout()
+        main_layout.addLayout(drop_zones_layout)
 
+        # Middle Row: Edited info and Reset
+        info_layout = QHBoxLayout()
         self.edited_list_label = QLabel("No images added")
-        reset_hbox.addWidget(self.edited_list_label)
-        reset_hbox.addStretch()
+        info_layout.addWidget(self.edited_list_label)
+        info_layout.addStretch()
 
         self.reset_btn = QPushButton("X Reset")
         self.reset_btn.setStyleSheet("background-color: #a00; color: white; font-weight: bold; padding: 5px;")
         self.reset_btn.clicked.connect(self.reset_edited_images)
-        reset_hbox.addWidget(self.reset_btn)
+        info_layout.addWidget(self.reset_btn)
 
-        edited_layout.addLayout(reset_hbox)
-        
-        top_row_layout.addLayout(edited_layout, 1)
-        main_layout.addLayout(top_row_layout)
+        main_layout.addLayout(info_layout)
 
         # Results area with Splitter
         self.results_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.results_splitter.splitterMoved.connect(self.on_splitter_moved)
         
         # Left: Thumbnails Section
         thumb_container = QWidget()
@@ -616,11 +629,14 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.results_splitter)
 
     def set_base_image(self, path):
+        self.reset_edited_images()
         self.base_image_path = path
         self.base_img = cv2.imread(path)
-        self.base_drop_zone.setText(f"Base Image: {os.path.basename(path)}")
+        self.base_drop_zone.setText(f"Base Image: Click or Drop Here\n{truncate(os.path.basename(path))}")
         self.analyze_differences()
         self.update_preview()
+        if hasattr(self, 'fit_checkbox') and self.fit_checkbox.isChecked():
+            self.apply_fit_to_window()
 
     def append_edited_image(self, path):
         if path not in self.edited_images_paths:
@@ -640,7 +656,7 @@ class MainWindow(QMainWindow):
             self.edited_list_label.setText("No images added")
         else:
             names = [os.path.basename(p) for p in self.edited_images_paths]
-            self.edited_list_label.setText(f"Images ({len(names)}): " + ", ".join(names[:5]) + ("..." if len(names) > 5 else ""))
+            self.edited_list_label.setText(f"Images ({len(names)}): " + truncate(", ".join(names), 90))
 
     def clear_thumbnails(self):
         while self.thumbnails_layout.count():
@@ -650,6 +666,7 @@ class MainWindow(QMainWindow):
         self.found_regions = []
         self.min_size_slider.setValue(0)
         self.min_region_size = 0
+        self.needs_recomposite = True
 
     def get_quadtree_regions(self, mask, min_size=16):
         def split(x, y, w, h):
@@ -774,7 +791,7 @@ class MainWindow(QMainWindow):
                     thumb_item.settingsChanged.connect(self.on_thumbnail_settings_changed)
                     self.thumbnails_layout.addWidget(thumb_item)
                     
-                    # Apply default "Overlap" shape
+                    # Apply default "Convex Hull" shape
                     self.update_region_mask(region_id)
         
         if self.found_regions:
@@ -792,6 +809,7 @@ class MainWindow(QMainWindow):
         self.min_region_size = value
         if value >= self.max_size_slider.value():
             self.max_size_slider.setValue(value + 1)
+        self.needs_recomposite = True
         self.update_thumbnail_visibility()
         self.update_preview()
 
@@ -799,6 +817,7 @@ class MainWindow(QMainWindow):
         self.max_region_size = value
         if value <= self.min_size_slider.value():
             self.min_size_slider.setValue(max(0, value - 1))
+        self.needs_recomposite = True
         self.update_thumbnail_visibility()
         self.update_preview()
 
@@ -815,6 +834,7 @@ class MainWindow(QMainWindow):
         self.thumbnails_layout.invalidate()
 
     def on_thumbnail_clicked(self, region_id):
+        self.needs_recomposite = True
         self.update_preview()
 
     def on_thumbnail_hovered(self, region_id):
@@ -827,6 +847,7 @@ class MainWindow(QMainWindow):
 
     def on_thumbnail_settings_changed(self, region_id):
         self.update_region_mask(region_id)
+        self.needs_recomposite = True
         self.update_preview()
 
     def update_region_mask(self, region_id):
@@ -844,12 +865,9 @@ class MainWindow(QMainWindow):
         cnt = region['master_contour']
         mask = np.zeros(region['mask'].shape, dtype=np.uint8)
         
-        if thumb_item.shape_type == "Overlap":
+        if thumb_item.shape_type == "Convex Hull":
             hull = cv2.convexHull(cnt)
             cv2.drawContours(mask, [hull], -1, 255, -1)
-        elif thumb_item.shape_type == "Tight Fit":
-            # For Tight Fit, we use the image-specific mask within this region
-            mask = cv2.bitwise_and(region['image_mask'], region['region_mask'])
         elif thumb_item.shape_type == "Rectangle":
             x, y, w, h = cv2.boundingRect(cnt)
             cv2.rectangle(mask, (x, y), (x+w, y+h), 255, -1)
@@ -887,21 +905,25 @@ class MainWindow(QMainWindow):
             self.base_img = cv2.imread(self.base_image_path)
             
         if self.base_img is None: return
-        base_img = cv2.cvtColor(self.base_img, cv2.COLOR_BGR2RGB)
         
-        composite = base_img.copy().astype(np.float32)
-        
-        for i in range(self.thumbnails_layout.count()):
-            item = self.thumbnails_layout.itemAt(i).widget()
-            if isinstance(item, ThumbnailItem) and item.selected and not item.isHidden():
-                region = self.found_regions[item.region_id]
-                mask = region['mask'].astype(np.float32) / 255.0
-                edit_img = cv2.cvtColor(region['edit_img'], cv2.COLOR_BGR2RGB).astype(np.float32)
-                
-                mask_3d = cv2.merge([mask, mask, mask])
-                composite = composite * (1 - mask_3d) + edit_img * mask_3d
+        if self.needs_recomposite or self.composite_cache is None:
+            base_img = cv2.cvtColor(self.base_img, cv2.COLOR_BGR2RGB)
+            composite = base_img.copy().astype(np.float32)
+            
+            for i in range(self.thumbnails_layout.count()):
+                item = self.thumbnails_layout.itemAt(i).widget()
+                if isinstance(item, ThumbnailItem) and item.selected and not item.isHidden():
+                    region = self.found_regions[item.region_id]
+                    mask = region['mask'].astype(np.float32) / 255.0
+                    edit_img = cv2.cvtColor(region['edit_img'], cv2.COLOR_BGR2RGB).astype(np.float32)
+                    
+                    mask_3d = cv2.merge([mask, mask, mask])
+                    composite = composite * (1 - mask_3d) + edit_img * mask_3d
 
-        composite = composite.astype(np.uint8)
+            self.composite_cache = composite.astype(np.uint8)
+            self.needs_recomposite = False
+
+        composite = self.composite_cache.copy()
         
         # Draw hover polygon
         if self.hovered_region_id is not None:
@@ -927,9 +949,6 @@ class MainWindow(QMainWindow):
         scaled_pix = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         self.preview_label.setPixmap(scaled_pix)
         self.preview_label.setFixedSize(scaled_pix.size())
-
-        if hasattr(self, 'fit_checkbox') and self.fit_checkbox.isChecked() and not getattr(self, '_setting_zoom_from_fit', False):
-            self.apply_fit_to_window()
 
     def copy_preview_to_clipboard(self, event):
         if self.current_preview_pixmap:
