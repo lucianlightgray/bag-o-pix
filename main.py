@@ -150,7 +150,7 @@ class ThumbnailItem(QFrame):
         self.selected = False
         self.thumb_size = thumb_size
         self.edge_margin = 0
-        self.shape_type = "Tight Fit"
+        self.shape_type = "Overlap"
         
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(4, 4, 4, 4)
@@ -176,7 +176,7 @@ class ThumbnailItem(QFrame):
         self.layout.addLayout(ctrl_layout)
         
         self.shape_combo = QComboBox()
-        self.shape_combo.addItems(["Tight Fit", "Rectangle", "Circle"])
+        self.shape_combo.addItems(["Overlap", "Tight Fit", "Rectangle", "Circle"])
         self.shape_combo.currentTextChanged.connect(self.on_shape_changed)
         self.layout.addWidget(self.shape_combo)
         
@@ -496,6 +496,42 @@ class MainWindow(QMainWindow):
         self.min_size_slider.setValue(0)
         self.min_region_size = 0
 
+    def get_quadtree_regions(self, mask, min_size=16):
+        def split(x, y, w, h):
+            if w <= min_size or h <= min_size:
+                if np.any(mask[y:y+h, x:x+w]):
+                    return [(x, y, w, h)]
+                return []
+            
+            roi = mask[y:y+h, x:x+w]
+            count = np.count_nonzero(roi)
+            if count == 0:
+                return []
+            if count == w * h:
+                return [(x, y, w, h)]
+            
+            # Mixed
+            hw, hh = w // 2, h // 2
+            return split(x, y, hw, hh) + \
+                   split(x + hw, y, w - hw, hh) + \
+                   split(x, y + hh, hw, h - hh) + \
+                   split(x + hw, y + hh, w - hw, h - hh)
+
+        rects = split(0, 0, mask.shape[1], mask.shape[0])
+        if not rects:
+            return []
+            
+        qt_mask = np.zeros_like(mask)
+        for x, y, w, h in rects:
+            qt_mask[y:y+h, x:x+w] = 255
+            
+        num_labels, labels = cv2.connectedComponents(qt_mask)
+        regions = []
+        for i in range(1, num_labels):
+            r_mask = (labels == i).astype(np.uint8) * 255
+            regions.append(r_mask)
+        return regions
+
     def analyze_differences(self):
         if not self.base_image_path or not self.edited_images_paths:
             return
@@ -504,6 +540,10 @@ class MainWindow(QMainWindow):
         base_img = cv2.imread(self.base_image_path)
         if base_img is None: return
 
+        # First pass: find all differences and merge them into a heatmap
+        all_diff_data = [] # List of (edit_img, thresh_mask)
+        heatmap = np.zeros(base_img.shape[:2], dtype=np.int32)
+        
         for edit_path in self.edited_images_paths:
             edit_img = cv2.imread(edit_path)
             if edit_img is None: continue
@@ -511,54 +551,72 @@ class MainWindow(QMainWindow):
             if edit_img.shape != base_img.shape:
                 edit_img = cv2.resize(edit_img, (base_img.shape[1], base_img.shape[0]))
 
-            # Matching algorithm with JPEG artifact tolerance
             diff = cv2.absdiff(base_img, edit_img)
             gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             
             # Use 50 as a reasonable threshold for JPEG artifacts. 
-            # 70% artifacting might mean 0.7 * 255 = 178, but that's very high.
-            # We'll use 50 which is quite tolerant.
             ret, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
             
             kernel = np.ones((5,5), np.uint8)
             thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
             thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            for cnt in contours:
-                if cv2.contourArea(cnt) < 100: continue
-                
-                epsilon = 0.01 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                x, y, w, h = cv2.boundingRect(approx)
-                
-                mask = np.zeros(gray.shape, dtype=np.uint8)
-                cv2.drawContours(mask, [approx], -1, 255, -1)
-                
-                region_crop = edit_img[y:y+h, x:x+w].copy()
-                thumb_img = cv2.cvtColor(region_crop, cv2.COLOR_BGR2RGB)
-                h_t, w_t, c_t = thumb_img.shape
-                q_img = QImage(thumb_img.data, w_t, h_t, 3 * w_t, QImage.Format.Format_RGB888)
-                pix = QPixmap.fromImage(q_img.copy())
-                
-                region_id = len(self.found_regions)
-                area = cv2.contourArea(approx)
-                self.found_regions.append({
-                    'contour': cnt,
-                    'approx': approx,
-                    'mask': mask,
-                    'edit_img': edit_img,
-                    'rect': (x, y, w, h),
-                    'area': area
-                })
-                
-                thumb_item = ThumbnailItem(pix, region_id, thumb_size=self.thumb_size)
-                thumb_item.clicked.connect(self.on_thumbnail_clicked)
-                thumb_item.hovered.connect(self.on_thumbnail_hovered)
-                thumb_item.unhovered.connect(self.on_thumbnail_unhovered)
-                thumb_item.settingsChanged.connect(self.on_thumbnail_settings_changed)
-                self.thumbnails_layout.addWidget(thumb_item)
+            heatmap += (thresh > 0).astype(np.int32)
+            all_diff_data.append((edit_img, thresh))
+
+        self.all_diffs_mask = (heatmap > 0).astype(np.uint8) * 255
+
+        # Second pass: find regions using Quadtree on the global mask
+        regions = self.get_quadtree_regions(self.all_diffs_mask)
+
+        # Third pass: create thumbnails grouped by (region, image)
+        for r_mask in regions:
+            # Find the master contour and bounding box of the region
+            contours, _ = cv2.findContours(r_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours: continue
+            
+            # Use largest contour if multiple (should be only one per region)
+            master_cnt = max(contours, key=cv2.contourArea)
+            epsilon = 0.01 * cv2.arcLength(master_cnt, True)
+            master_approx = cv2.approxPolyDP(master_cnt, epsilon, True)
+            x, y, w, h = cv2.boundingRect(master_approx)
+            area = cv2.contourArea(master_approx)
+            
+            for edit_img, thresh in all_diff_data:
+                # Only show one thumbnail per edited image, per region
+                # Check intersection of this image's difference with this region
+                intersection = cv2.bitwise_and(thresh, r_mask)
+                if cv2.countNonZero(intersection) > 0:
+                    # Initial mask will be updated by update_region_mask
+                    mask = np.zeros(base_img.shape[:2], dtype=np.uint8)
+                    
+                    region_crop = edit_img[y:y+h, x:x+w].copy()
+                    thumb_img = cv2.cvtColor(region_crop, cv2.COLOR_BGR2RGB)
+                    h_t, w_t, c_t = thumb_img.shape
+                    q_img = QImage(thumb_img.data, w_t, h_t, 3 * w_t, QImage.Format.Format_RGB888)
+                    pix = QPixmap.fromImage(q_img.copy())
+                    
+                    region_id = len(self.found_regions)
+                    self.found_regions.append({
+                        'master_contour': master_cnt,
+                        'master_approx': master_approx,
+                        'region_mask': r_mask,
+                        'image_mask': thresh,
+                        'mask': mask,
+                        'edit_img': edit_img,
+                        'rect': (x, y, w, h),
+                        'area': area
+                    })
+                    
+                    thumb_item = ThumbnailItem(pix, region_id, thumb_size=self.thumb_size)
+                    thumb_item.clicked.connect(self.on_thumbnail_clicked)
+                    thumb_item.hovered.connect(self.on_thumbnail_hovered)
+                    thumb_item.unhovered.connect(self.on_thumbnail_unhovered)
+                    thumb_item.settingsChanged.connect(self.on_thumbnail_settings_changed)
+                    self.thumbnails_layout.addWidget(thumb_item)
+                    
+                    # Apply default "Overlap" shape
+                    self.update_region_mask(region_id)
         
         if self.found_regions:
             max_area = max(r['area'] for r in self.found_regions)
@@ -624,13 +682,14 @@ class MainWindow(QMainWindow):
         if not thumb_item: return
 
         # Recalculate mask based on shape and edge margin
-        cnt = region['contour']
+        cnt = region['master_contour']
         mask = np.zeros(region['mask'].shape, dtype=np.uint8)
         
-        if thumb_item.shape_type == "Tight Fit":
-            epsilon = 0.01 * cv2.arcLength(cnt, True)
-            poly = cv2.approxPolyDP(cnt, epsilon, True)
-            cv2.drawContours(mask, [poly], -1, 255, -1)
+        if thumb_item.shape_type == "Overlap":
+            mask = region['region_mask'].copy()
+        elif thumb_item.shape_type == "Tight Fit":
+            # For Tight Fit, we use the image-specific mask within this region
+            mask = cv2.bitwise_and(region['image_mask'], region['region_mask'])
         elif thumb_item.shape_type == "Rectangle":
             x, y, w, h = cv2.boundingRect(cnt)
             cv2.rectangle(mask, (x, y), (x+w, y+h), 255, -1)
@@ -648,10 +707,10 @@ class MainWindow(QMainWindow):
                 mask = cv2.erode(mask, kernel, iterations=1)
         
         region['mask'] = mask
-        # Update rect for preview/hover if needed
+        # Update approx for preview/hover if needed
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
-            region['approx'] = contours[0] # Just take first for overlay
+            region['master_approx'] = max(contours, key=cv2.contourArea) # Update approx for overlay
         
     def update_preview(self):
         if not self.base_image_path:
@@ -680,7 +739,7 @@ class MainWindow(QMainWindow):
         if self.hovered_region_id is not None:
             region = self.found_regions[self.hovered_region_id]
             overlay = composite.copy()
-            cv2.drawContours(overlay, [region['approx']], -1, (255, 255, 0), 2)
+            cv2.drawContours(overlay, [region['master_approx']], -1, (255, 255, 0), 2)
             composite = cv2.addWeighted(overlay, 0.7, composite, 0.3, 0)
 
         h, w, c = composite.shape
