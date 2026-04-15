@@ -7,7 +7,7 @@ import colorsys
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QScrollArea, QFileDialog, QFrame,
                              QSplitter, QComboBox, QToolBar, QLayout, QSlider, QCheckBox)
-from PyQt6.QtCore import Qt, QMimeData, QSize, pyqtSignal, QPoint, QUrl, QRect, QEvent, QTimer
+from PyQt6.QtCore import Qt, QMimeData, QSize, pyqtSignal, QPoint, QUrl, QRect, QEvent, QTimer, QPointF
 from PyQt6.QtGui import QPixmap, QImage, QDrag, QColor, QPalette, QShortcut, QKeySequence
 
 class DropZone(QLabel):
@@ -318,11 +318,59 @@ class MainWindow(QMainWindow):
             # Intercept Wheel event in preview area for Zoom (CTRL) and Horizontal Scroll (SHIFT)
             if source is self.preview_scroll.viewport():
                 if mods == Qt.KeyboardModifier.ControlModifier:
+                    # Current mouse position in viewport
+                    pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+                    
+                    # Store point in image coordinates before zoom
+                    old_zoom = self.preview_zoom
+                    local_pos = self.preview_label.mapFrom(self.preview_scroll.viewport(), pos)
+                    orig_point = QPointF(local_pos) / old_zoom
+
                     if delta > 0:
-                        new_zoom = min(5.0, self.preview_zoom + 0.1)
+                        new_zoom = min(5.0, old_zoom + 0.1)
                     else:
-                        new_zoom = max(0.1, self.preview_zoom - 0.1)
-                    self.zoom_slider.setValue(int(new_zoom * 100))
+                        new_zoom = max(0.1, old_zoom - 0.1)
+                    
+                    if new_zoom != old_zoom:
+                        # Update slider which triggers update_preview
+                        self.zoom_slider.setValue(int(new_zoom * 100))
+                        
+                        # Adjust scrollbars to keep orig_point under the mouse
+                        # We need the new position of orig_point in the scaled label
+                        new_local_pos = orig_point * new_zoom
+                        
+                        # QScrollArea might have updated centering if label size changed.
+                        # We want: new_local_pos (in label) to appear at 'pos' (in viewport).
+                        # viewport_pos = label_pos - scroll_pos + offset
+                        # where offset is usually (0,0) if label > viewport, or centering if label < viewport.
+                        # mapTo viewport from label handles this:
+                        # current_viewport_pos = label.mapTo(viewport, new_local_pos)
+                        # We want current_viewport_pos to be 'pos'.
+                        
+                        # Scroll adjustment:
+                        h_bar = self.preview_scroll.horizontalScrollBar()
+                        v_bar = self.preview_scroll.verticalScrollBar()
+                        
+                        # new_h = h_bar.value() + (current_viewport_pos.x() - pos.x())
+                        # But mapTo depends on current scroll value.
+                        
+                        # Standard zoom-at-point formula:
+                        # new_scroll = (old_scroll + mouse_pos_in_viewport) * (new_zoom / old_zoom) - mouse_pos_in_viewport
+                        # This assumes (0,0) is top-left of the content.
+                        
+                        # Since we have centering, let's just calculate the absolute target scroll:
+                        # target_scroll_h = new_local_pos.x() - pos.x() + centering_offset
+                        
+                        vp = self.preview_scroll.viewport()
+                        off_x = max(0, (vp.width() - self.preview_label.width()) // 2)
+                        off_y = max(0, (vp.height() - self.preview_label.height()) // 2)
+
+                        new_h = int(new_local_pos.x() - pos.x() + off_x)
+                        new_v = int(new_local_pos.y() - pos.y() + off_y)
+                        
+                        h_bar.setValue(new_h)
+                        v_bar.setValue(new_v)
+                        
                     return True
                 elif mods == Qt.KeyboardModifier.ShiftModifier:
                     hbar = self.preview_scroll.horizontalScrollBar()
@@ -346,14 +394,13 @@ class MainWindow(QMainWindow):
             self.apply_fit_to_window()
 
     def apply_fit_to_window(self):
-        if not self.current_preview_pixmap:
+        if self.base_img is None:
             return
         
         available_width = self.preview_scroll.viewport().width() - 4 # Small margin
         available_height = self.preview_scroll.viewport().height() - 4
         
-        img_width = self.current_preview_pixmap.width()
-        img_height = self.current_preview_pixmap.height()
+        img_height, img_width = self.base_img.shape[:2]
         
         if img_width <= 0 or img_height <= 0:
             return
@@ -881,7 +928,8 @@ class MainWindow(QMainWindow):
         self.preview_label.setPixmap(scaled_pix)
         self.preview_label.setFixedSize(scaled_pix.size())
 
-        self.apply_fit_to_window()
+        if hasattr(self, 'fit_checkbox') and self.fit_checkbox.isChecked() and not getattr(self, '_setting_zoom_from_fit', False):
+            self.apply_fit_to_window()
 
     def copy_preview_to_clipboard(self, event):
         if self.current_preview_pixmap:
